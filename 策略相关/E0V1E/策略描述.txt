@@ -1,0 +1,1 @@
+策略源于GitHub上的大佬：https://github.com/ssssi/freqtrade_strs

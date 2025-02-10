@@ -1,0 +1,4 @@
+修改了下面两点：
+maxopentrade = 1
+trailing_stop = true
+
