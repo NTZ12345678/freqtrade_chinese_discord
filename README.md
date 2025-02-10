@@ -6,7 +6,9 @@
 
 非代码相关工作人员，非金融背景，某公司产品小弟，还在学习freqtrade，争取开发一个自己的赚钱策略，一起多多交流学习进步
 
-#Discord
-
+#群聊
+discord
 https://discord.gg/cgmKwuBD
+telegram
+https://t.me/+0X4mlXhey2w0NTkx
 
