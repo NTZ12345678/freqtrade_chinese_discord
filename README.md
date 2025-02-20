@@ -8,7 +8,7 @@
 
 #群聊
 discord
-https://discord.gg/cgmKwuBD
+https://discord.gg/3bcgqDgS
 telegram
 https://t.me/+0X4mlXhey2w0NTkx
 
