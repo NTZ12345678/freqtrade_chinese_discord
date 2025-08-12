@@ -1,14 +1,24 @@
-# freqtrade_result
 
-记录自己实盘策略的结果以及存放学习过程的文件
+# Freqtrade 中文交流社区 🚀
+这里不仅是交流，更是策略成长的温床！
+无论你是刚入门的小白，还是追求极致优化的老手，都能在这里找到志同道合的伙伴。
 
-#个人背景描述
+群内亮点
 
-非代码相关工作人员，非金融背景，某公司产品小弟，还在学习freqtrade，争取开发一个自己的赚钱策略，一起多多交流学习进步
+💡 策略源码分享：从经典策略到创新玩法应有尽有
 
-#群聊
-discord
-https://discord.gg/3EABfUPxbQ
-telegram
-https://t.me/+0X4mlXhey2w0NTkx
+📊 实盘案例解析：真实数据复盘+风险控制经验
+
+🤖 FreqAI 与量化模型：LSTM,TRANSFORMER
+
+⚙️ 多主题频道：马丁格尔、套利、回测优化等
+
+👑 大佬云集：包括 E0V1E 等策略作者亲临答疑
+
+加入方式
+📌 Discord（中文为主）：https://discord.gg/3EABfUPxbQ
+📌 Telegram：https://t.me/+0X4mlXhey2w0NTkx（不活跃，主要进discord）
+
+来吧，不只是聊天，这里让你的策略真正落地、赚钱！
+(BY CHATGPT)
 
