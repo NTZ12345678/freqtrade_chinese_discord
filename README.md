@@ -1,4 +1,4 @@
-<img width="1689" height="975" alt="afcbe8e0e34628bb2d9e2af200f9090" src="https://github.com/user-attachments/assets/44b1762e-0a70-480e-ab31-7c690f5f4a47" /><img width="1689" height="975" alt="afcbe8e0e34628bb2d9e2af200f9090" src="https://github.com/user-attachments/assets/ecee219f-e8db-4a09-b9fa-10c5f5551d27" />
+<img width="1689" height="975" alt="afcbe8e0e34628bb2d9e2af200f9090" src="https://github.com/user-attachments/assets/44b1762e-0a70-480e-ab31-7c690f5f4a47" />
 # Freqtrade 中文交流社区 🚀
 这里不仅是交流，更是策略成长的温床！
 无论你是刚入门的小白，还是追求极致优化的老手，都能在这里找到志同道合的伙伴。
