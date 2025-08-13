@@ -9,11 +9,11 @@
 
 📊 实盘案例解析：真实数据复盘+风险控制经验
 
-🤖 FreqAI 与量化模型：LSTM,TRANSFORMER
+🤖 FreqAI 与量化模型：LSTM,增强LSTM
 
 ⚙️ 多主题频道：马丁格尔、套利、回测优化等
 
-👑 大佬云集：包括 E0V1E 等策略作者亲临答疑
+👑 大佬云集：包括 E0V1E 等策略作者一起玩耍
 
 加入方式
 📌 Discord（中文为主）：https://discord.gg/3EABfUPxbQ
