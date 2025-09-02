@@ -16,7 +16,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-
+# discord该策略实时推送，欢迎来玩，https://discord.gg/3EABfUPxbQ
 class pair_trading_get_para_V1_J_price_0723(IStrategy):
     can_short = True
     timeframe = '5m'
