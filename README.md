@@ -11,14 +11,12 @@
 
 🤖 FreqAI 与量化模型：LSTM,增强LSTM
 
-⚙️ 多主题频道：马丁格尔、套利、回测优化等
+⚙️ 多主题频道：E0V1E专属频道、加密货币因子资料频道、策略源码、量化小功能源码，alpha羊毛频道、带单跟单频道、freqtrade Issue频道、配对套利频道、马丁格尔频道等
 
 👑 大佬云集：包括 E0V1E 等策略作者一起玩耍
 
 加入方式
 📌 Discord（中文为主）：https://discord.gg/3EABfUPxbQ
-📌 Telegram：https://t.me/+0X4mlXhey2w0NTkx（不活跃，主要进discord）
 
 来吧，不只是聊天，这里让你的策略真正落地、赚钱！
-(BY CHATGPT)
 
