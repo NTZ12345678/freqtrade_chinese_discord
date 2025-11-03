@@ -17,6 +17,8 @@ import logging
 logger = logging.getLogger(__name__)
 
 '''
+讨论群
+https://discord.gg/hfxRh74mK7
 martin short long 策略
 策略整体思路：
 1、主流币做多马丁，非主流币做空马丁，将原来的两个策略融合在一起，资金分开管理
