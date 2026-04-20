@@ -1,0 +1,22 @@
+ROI: Closed trades
+∙ 135.327 USDT (0.63%) (14.25 Σ%)
+∙ 135.327 USD
+ROI: All trades
+∙ 74.807 USDT (0.33%) (7.88 Σ%)
+∙ 74.807 USD
+Total Trade Count: 1119
+Bot started: 2026-02-22 03:25:57
+First Trade opened: 2 months ago (2026-02-22 03:27:42)
+Latest Trade opened: 6 hours ago (2026-04-20 02:30:16)
+Win / Loss: 571 / 506
+Winrate: 53.02%
+Expectancy (Ratio): 0.13 (0.58)
+Avg. Duration: 1 day, 4:24:08
+Best Performing: DENT/USDT:USDT: 19.045 USDT (1.14%)
+Trading volume: 43293.019 USDT
+Profit factor: 2.24
+Max Drawdown: 0.68% (7.331 USDT)
+    from 2026-04-12 16:20:06 (131.478 USDT)
+    to 2026-04-12 17:20:11 (124.147 USDT)
+Current Drawdown: 0.43% (4.736 USDT)
+    from 2026-04-18 06:30:11 (140.062 USDT)
