@@ -1,23 +1,32 @@
-1、运行环境：Freqtrade 2026.9，另安装 statsmodels。使用 Binance U本位永续合约、5m K线、全仓模式。
+运行环境：Freqtrade 2026.9，安装statsmodels。Binance U本位永续、5m、全仓；getpara只手动运行。
 
-2、本版已合并Shadow与基础版，固定包含K外模拟仓，不再分别选择版本。
-PairTradingV8Deploy：模拟盘/实盘入口。
-PairTradingV8Aligned：离线回测入口，继承相同交易逻辑。
-pair_trading_get_para_V8：计算币对。
-runtime.py ：参数、状态文件和组合关系的管理。
-将这四个文件一起放入 user_data/strategies/。三个回测工具已内置到 PairTradingV8Aligned.py，部署端不会安装这些回测适配。
+1、把四个Python文件放入user_data/strategies/：
+pair_trading_get_para_V8.py：计算和筛选参数。
+PairTradingV8Deploy.py：模拟盘/实盘入口，包含模拟仓、状态及共用读写函数。
+PairTradingV8Aligned.py：离线回测入口。
+delist_watch.py：独立退市监控，不下单、不需要API密钥。
+把config_getpara.json复制到user_data/config_getpara.json。候选池默认匹配当前Binance USDT永续，也可自行收窄；不要用交易白名单覆盖候选池。
 
-3、先手动计算此前90天的Binance参数，通过配套V8筛选/发布工具生成参数目录，每批最多40组。后续更新也手动进行。
-pair_trading_get_para_V8.py 内部类名仍为 pair_trading_get_para_V6，只提供计算组件；完整下载、筛选和发布工具不在本目录，不能直接把旧版字典JSON当作V8发布包。
+2、下载此前完整90天行情，再用回测命令计算参数。示例截止时间为2026-10-17 00:00 UTC，实际使用时替换为对应的90天区间：
+freqtrade download-data --config user_data/config_getpara.json --timeframes 5m --timerange 20260719-20261017
+freqtrade backtesting --config user_data/config_getpara.json --strategy-path user_data/strategies --strategy pair_trading_get_para_V8 --timerange 20260719-20261017 --cache none --export none
+这个回测命令只计算参数，不开仓。必须明确截止时间；数据不足90天、缺K线或价格无效的币种会排除，不填充后用于拟合。统计门槛与原本地流程相同，最多选择40组互不共享币种的组合；getpara_max_pairs可覆盖数量。候选池默认仅适用于当前部署，历史研究必须使用当时的币种清单，不能用今天的活跃名单替代。
 
-4、在Freqtrade配置中设置 dry_run=true，exchange.name="binance"、trading_mode="futures"、margin_mode="cross"。atr_fixed_parameters 设置 n_days=14、leverage_choice=1、max_pairs=18；max_open_trades 至少为 2×max_pairs。
-同时填写 atr_release_root（参数目录）、atr_schedule（该发布包的schedule.json）、atr_state_path（生命周期状态JSON）、atr_live_delisting（退市监控JSON）。首次 pair_whitelist 要覆盖参数发布包内的币种，并使用 StaticPairList。
+3、默认生成user_data/v8/parameters.json，只有asof和selected；selected包含币名及完整交易系数。历次相同格式的文件保存在parameters_history/。无合格结果时保留旧文件；相同内容重复发布不会重置策略或重试已拒绝的关系。
+首次还生成user_data/config_v8.json，默认模拟盘、1000 USDT模拟资金；已有配置保持不变，后续getpara更新只需发布参数。参数路径可用atr_parameters覆盖，首次生成的配置会带上自定义路径。
+部署默认N14、1倍、K18，max_open_trades不足时自动提高至2×K。需要修改时在atr_fixed_parameters中填写n_days、leverage_choice、max_pairs；只填要修改的项，其余使用默认值。
 
-5、先运行配套退市监控，确认监控文件更新正常，再启动模拟盘：
+4、先在另一个终端启动监控：
+python user_data/strategies/delist_watch.py run --userdir user_data
+默认每5分钟检查公告和合约状态，写入user_data/v8/state/；scan替代run可单次检查。可用--state-dir更改目录，并将Deploy配置的atr_live_delisting指向同一目录的live_delisting.json。
+首次扫描正常后启动模拟盘：
 freqtrade trade --config user_data/config_v8.json --strategy-path user_data/strategies --strategy PairTradingV8Deploy
-确认双腿入场、退出和N计时正常后，再另行准备实盘。API密钥通过环境变量提供，不写入源码或上传GitHub。
+确认退市公告后立即禁入并退出双腿，不等实际退市；保留禁入记录，持续管理残腿。来源失败或监控超过30分钟未更新时阻止新增入场，已有持仓继续退出。监控需与机器人一起持续运行。
 
-6、K控制真实持仓容量，40控制每批候选数，两者独立。K外模拟仓不占资金和名额，转实仓时继承模拟N起点；已有仓位不随入金或K变化而调整大小。
-重启须保留原交易数据库、参数发布目录和生命周期状态，不能清空模拟记录来重置N。
+5、重启保留原交易数据库、parameters.json和v8/state/。模拟盘状态默认dryrun.json，实盘为live.json。K外模拟仓不占资金或K，转实仓继承N起点；更新参数或增加资金不调整已有仓位。实盘需另行检查账户、资金和API权限，密钥使用环境变量，不写入配置或上传GitHub。
 
-7、离线回测还需配套研究入口、因果参数日程、行情/资金费、冻结市场规则及退市结算适配。本目录不包含完整研究控制器和数据；历史回测结果仍对应报告注明的冻结版本。
+6、Aligned读取同一个parameters.json；多轮回放可将atr_schedule设置为parameters_history目录。只有截止时间的参数默认假设延迟15分钟可用，可用atr_publication_delay_minutes覆盖；不能用拟合窗口的参数回测该窗口并当作因果结果。
+先下载回测交易区间（需覆盖预热、资金费和标记价格），再运行：
+freqtrade backtesting --config user_data/config_v8.json --config user_data/config_history.json --strategy-path user_data/strategies --strategy PairTradingV8Aligned --timerange <交易区间> --cache none --export trades
+config_history.json需指定atr_historical_delistings（冻结历史公告文件）、atr_settlements（冻结退市结算表）；缺失时拒绝启动，不能用今天的live_delisting.json替代。可用atr_exchange_snapshot指定冻结市场规则。历史文件需覆盖所回测区间，包括明确的无事件区间；不是getpara生成的数据，也不是空占位文件。
+本目录不附带完整历史行情和研究数据。正式历史池研究仍走原研究控制器及资金费/结算验收；目录内报告对应其原冻结版本，不是本次整理后的收益结果。原生cross回测仍为近似，且未计滑点。

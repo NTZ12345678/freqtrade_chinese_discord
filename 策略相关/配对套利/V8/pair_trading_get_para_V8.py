@@ -1,112 +1,192 @@
+"""Compute one causal V8 publication through Freqtrade's backtesting command."""
 import itertools
-import json
 import logging
-import os
-import tempfile
+from decimal import Decimal, ROUND_CEILING
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
+from freqtrade.configuration import TimeRange
+from freqtrade.data.history import load_pair_history
+from freqtrade.enums import CandleType
 from freqtrade.strategy.interface import IStrategy
 from statsmodels.tsa.stattools import adfuller
+
+from PairTradingV8Deploy import (
+    atomic, canonical, default_config, parameter_path, publish, positive_count,
+)
 
 logger = logging.getLogger(__name__)
 
 
-class pair_trading_get_para_V6(IStrategy):
+def order_feasibility(pair, price, markets, config):
+    """Reject only impossible orders; pair allocation is still checked at actual entry.
+
+    A fixed 27.5-USDT coin cutoff would incorrectly discard asymmetric pairs and
+    pairs trading with fewer active allocations. Use the whole portfolio as an
+    upper bound, and publish the real minimum required at the causal last price.
+    """
+    market = markets.get(pair)
+    if market is None:
+        return None, 'missing_exchange_order_filters'
+    filters = {f['filterType']: f for f in market['filters']}
+    lot = filters.get('LOT_SIZE', {})
+    p = Decimal(str(price))
+    step = Decimal(lot.get('stepSize', '0'))
+    minimum = Decimal(lot.get('minQty', '0'))
+    maximum = Decimal(lot.get('maxQty', '0'))
+    notional = Decimal(filters.get('MIN_NOTIONAL', {}).get('notional', '0'))
+    if step <= 0 or maximum <= 0 or notional <= 0:
+        return None, 'invalid_exchange_order_filters'
+    amount = (max(minimum, notional/p)/step).to_integral_value(rounding=ROUND_CEILING)*step
+    required = amount*p
+    upper = Decimal(str(config.get('dry_run_wallet', 1000))) * Decimal(str(config.get('tradable_balance_ratio', .99))) * 3
+    if amount > maximum or required*Decimal('1.05') > upper:
+        return None, 'minimum_order_exceeds_portfolio_capacity'
+    return dict(last_completed_price=float(p), step_size=float(step), min_qty=float(minimum),
+                min_notional=float(notional), rounded_min_qty=float(amount),
+                rounded_min_notional=float(required), portfolio_upper_notional=float(upper),
+                scope='Coin feasibility upper bound; actual pair budget/rounding checked at entry'), None
+
+
+
+def select_combinations(records, max_pairs=40):
+    """Same gates and stable ordering as the local build_snapshots pipeline."""
+    positive_count(max_pairs, 'getpara_max_pairs')
+    valid = [row for row in records if
+             all(not isinstance(row.get(k), bool) and isinstance(row.get(k), (int, float))
+                 and np.isfinite(row[k]) for k in ('gamma', 'c', 'z_mean', 'z_std', 'half_life', 'adfstat'))
+             and row['adfstat'] < -6 and 0 < row['half_life'] < 500
+             and row['gamma'] > 0 and row['z_std'] > 0]
+    result, occupied = [], set()
+    for row in sorted(valid, key=lambda r: (r['half_life'], r['adfstat'], canonical(r), r['pair_A'], r['pair_B'])):
+        if occupied.intersection(canonical(row)):
+            continue
+        result.append(row)
+        occupied.update(canonical(row))
+        if len(result) == max_pairs:
+            break
+    return result
+
+
+class pair_trading_get_para_V8(IStrategy):
+    INTERFACE_VERSION = 3
     can_short = True
-    timeframe = "5m"
-    startup_candle_count = 10
+    timeframe = '5m'
+    startup_candle_count = 0
     process_only_new_candles = False
-    minimal_roi = {"0": 1}
-    stoploss = -0.99
-    use_custom_stoploss = False  # 不启用动态止损
+    minimal_roi = {'0': 1}
+    stoploss = -.99
 
     def __init__(self, config):
         super().__init__(config)
-        self.whitelist = config.get("exchange", {}).get("pair_whitelist", [])
-        self.all_counters = len(self.whitelist) * (len(self.whitelist) - 1)
-        self.counter = 0
+        self._parameters_written = False
 
-    def populate_indicators(self, dataframe: pd.DataFrame, metadata: dict) -> pd.DataFrame:
-        if self.dp.runmode.value != "backtest":
-            raise ValueError("参数计算只允许在历史数据模式运行，禁止覆盖运行参数")
-        if not self.whitelist:
-            raise ValueError("参数计算白名单不能为空")
-        current_pair = metadata["pair"]
-        dataframe["zero"] = 0
+    def _cutoff(self):
+        timerange = TimeRange.parse_timerange(self.config.get('timerange'))
+        if timerange.stopts == 0:
+            raise ValueError('getpara requires an explicit --timerange end (the data cutoff)')
+        end = pd.Timestamp(timerange.stopts, unit='s', tz='UTC')
+        if end != end.floor('5min') or end > pd.Timestamp.now(tz='UTC').floor('5min'):
+            raise ValueError('getpara cutoff must be a completed UTC 5-minute boundary')
+        start = end-pd.Timedelta(days=90)
+        if timerange.startts and pd.Timestamp(timerange.startts, unit='s', tz='UTC') != start:
+            raise ValueError('getpara --timerange must cover exactly the preceding 90 days')
+        return start, end
 
-        if current_pair != self.whitelist[-1]:
-            return dataframe
+    def _read_frames(self, pairs, start, end):
+        timerange = TimeRange('date', 'date', int(start.timestamp()), int(end.timestamp()))
+        return {pair: load_pair_history(pair=pair, timeframe='5m',
+                    datadir=Path(self.config['datadir']), timerange=timerange,
+                    fill_up_missing=False, drop_incomplete=False, startup_candles=0,
+                    data_format=self.config.get('dataformat_ohlcv', 'feather'),
+                    candle_type=CandleType.FUTURES) for pair in pairs}
 
-        all_new_params = {}
-        log_close_prices = {}
-
-        all_dfs = {
-            pair: self.dp.get_pair_dataframe(pair, self.timeframe) for pair in self.whitelist
-        }
-
-        for pair, df in all_dfs.items():
-            if df is not None and not df.empty:
-                log_close_prices[f"{pair}_log_close"] = df["close"].iloc[-1]
-
-        for pair_y, pair_x in itertools.permutations(self.whitelist, 2):
+    def calculate(self, frames, cutoff, markets=None):
+        """Pure calculation used by both the native entry and synthetic acceptance."""
+        end = pd.Timestamp(cutoff)
+        if end.tzinfo is None or end > pd.Timestamp.now(tz='UTC').floor('5min') or end != end.floor('5min'):
+            raise ValueError('Invalid getpara data cutoff')
+        grid = pd.date_range(end-pd.Timedelta(days=90), end, freq='5min', inclusive='left').as_unit('ns')
+        valid, excluded = {}, {}
+        for pair, frame in sorted(frames.items()):
+            if not pair.endswith('/USDT:USDT'):
+                excluded[pair] = 'not_usdt_perpetual'
+                continue
+            if frame is None or not {'date', 'close'}.issubset(frame.columns):
+                excluded[pair] = 'missing_history'
+                continue
+            frame = frame.loc[(frame.date >= grid[0]) & (frame.date < end), ['date', 'close']].sort_values('date')
+            prices = frame.close.to_numpy()
+            if len(frame) != len(grid) or not pd.DatetimeIndex(frame.date).as_unit('ns').equals(grid):
+                excluded[pair] = 'incomplete_90_day_history'
+            elif not np.isfinite(prices).all() or (prices <= 0).any() or np.std(prices) == 0:
+                excluded[pair] = 'invalid_price'
+            else:
+                if markets is not None:
+                    _, reason = order_feasibility(pair, prices[-1], markets, self.config)
+                    if reason:
+                        excluded[pair] = reason
+                        continue
+                valid[pair] = frame.close.reset_index(drop=True)
+        if len(valid) < 2:
+            raise ValueError('Fewer than two coins have complete valid 90-day history; old parameters retained: ' + str(excluded))
+        records = []
+        for a, b in itertools.permutations(valid, 2):
             try:
-                df_y = all_dfs[pair_y]
-                df_x = all_dfs[pair_x]
+                c, gamma, residual, zm, zs, crossings, consistency, half, corr = self.fn_ecm(
+                    pd.DataFrame(dict(y=valid[a], x=valid[b])), 'y', 'x')
+                pvalue, adf = self.adf_test_on_residuals(residual)
+            except (ValueError, np.linalg.LinAlgError) as exc:
+                logger.warning('Invalid fit %s / %s: %s', a, b, exc)
+                continue
+            records.append(self.convert_numpy_types(dict(pair_A=a, pair_B=b, gamma=gamma, c=c,
+                           z_mean=zm, z_std=zs, half_life=half, adfstat=adf)))
+        selected = select_combinations(records, self.config.get('getpara_max_pairs', 40))
+        if not selected:
+            raise ValueError('No qualified combinations; old parameters retained')
+        logger.info('getpara cutoff=%s eligible=%s selected=%s exclusions=%s', end.isoformat(), len(valid), len(selected), excluded)
+        return dict(asof=end.isoformat(), selected=selected)
 
-                if df_y is None or df_x is None:
-                    continue
-                df_merged = self.align_prices(df_y, df_x)
-
-                if len(df_merged) < 300:
-                    continue
-
-                (
-                    c,
-                    gamma,
-                    z,
-                    z_mean,
-                    z_std,
-                    z_cross_zero_count,
-                    consistency_score,
-                    half_life,
-                    corr,
-                ) = self.fn_ecm(df_merged, "y", "x")
-                self.counter += 1
-                logger.info(f"已分析 {self.counter}/{self.all_counters} ")
-
-                pvalue, adfstat = self.adf_test_on_residuals(z)
-
-                pair_key = f"{pair_y}_{pair_x}"
-
-                all_new_params[pair_key] = {
-                    "pvalue": pvalue,
-                    "adfstat": adfstat,
-                    "gamma": gamma,
-                    "c": c,
-                    "z_mean": z_mean,
-                    "z_std": z_std,
-                    "z_cross_zero_count": z_cross_zero_count,
-                    "consistency_score": consistency_score,
-                    "half_life": half_life,
-                    "corr": corr,
-                    "regression_y": pair_y,
-                    "regression_x": pair_x,
-                }
-            except Exception as e:
-                logger.error(f"分析配对 {pair_y}/{pair_x} 时出错: {e}")
-        self.overwrite_run_config_params(all_new_params, log_close_prices)
-
+    def populate_indicators(self, dataframe, metadata):
+        mode = getattr(self.dp.runmode, 'value', self.dp.runmode)
+        if mode != 'backtest':
+            raise ValueError('getpara runs only through historical backtesting, never live/dry_run')
+        if (self.config.get('exchange', {}).get('name'), self.config.get('trading_mode'), self.config.get('margin_mode')) != ('binance', 'futures', 'cross'):
+            raise ValueError('getpara requires Binance futures cross inputs')
+        if self.config.get('timeframe', '5m') != '5m':
+            raise ValueError('getpara requires 5m candles')
+        if self._parameters_written:
+            return dataframe
+        start, end = self._cutoff()
+        frames = self._read_frames(self.dp.current_whitelist(), start, end)
+        markets = {pair: (self.dp.market(pair) or {}).get('info') for pair in frames}
+        snapshot = self.calculate(frames, end, markets)
+        publish(parameter_path(self.config), snapshot)
+        config_path = Path(self.config.get('getpara_run_config',
+                           str(Path(self.config.get('user_data_dir', 'user_data'))/'config_v8.json')))
+        if not config_path.exists():
+            config = default_config({p for row in snapshot['selected'] for p in canonical(row)})
+            for name in ('dry_run_wallet', 'tradable_balance_ratio', 'atr_fixed_parameters', 'dataformat_ohlcv'):
+                if name in self.config:
+                    config[name] = self.config[name]
+            if self.config.get('atr_parameters'):
+                config['atr_parameters'] = str(parameter_path(self.config))
+            atomic(config_path, config)
+        self._parameters_written = True
+        logger.info('V8 parameters written to %s; paper configuration: %s (existing configuration preserved)',
+                    parameter_path(self.config), config_path)
         return dataframe
 
-    def populate_entry_trend(self, dataframe: pd.DataFrame, metadata: dict) -> pd.DataFrame:
+    def populate_entry_trend(self, dataframe, metadata):
+        dataframe['enter_long'] = dataframe['enter_short'] = 0
         return dataframe
 
-    def populate_exit_trend(self, dataframe: pd.DataFrame, metadata: dict) -> pd.DataFrame:
-
+    def populate_exit_trend(self, dataframe, metadata):
+        dataframe['exit_long'] = dataframe['exit_short'] = 0
         return dataframe
+
 
     @staticmethod
     def align_prices(df_y, df_x):
@@ -131,6 +211,7 @@ class pair_trading_get_para_V6(IStrategy):
         valid = np.isfinite(merged[["y", "x"]]).all(axis=1)
         valid &= (merged[["y", "x"]] > 0).all(axis=1)
         return merged.loc[valid, ["y", "x"]].reset_index(drop=True)
+
 
     def fn_ecm(self, df: pd.DataFrame, y_col: str, x_col: str):
         y = df[y_col]
@@ -199,6 +280,7 @@ class pair_trading_get_para_V6(IStrategy):
 
         return c, gamma, z, z_mean, z_std, z_cross_zero_count, consistency_score, half_life, corr
 
+
     def convert_numpy_types(self, obj):
         if isinstance(obj, dict):
             return {k: self.convert_numpy_types(v) for k, v in obj.items()}
@@ -209,6 +291,7 @@ class pair_trading_get_para_V6(IStrategy):
         if isinstance(obj, float) and not np.isfinite(obj):
             return None
         return obj
+
 
     def adf_test_on_residuals(self, z: pd.Series) -> tuple[float, float]:
         """
@@ -223,91 +306,3 @@ class pair_trading_get_para_V6(IStrategy):
         adfstat, pvalue, usedlag, nobs, crit_values = adfuller(z_cleaned, maxlag=1, autolag=None)
 
         return pvalue, adfstat
-
-    def overwrite_run_config_params(self, new_params: dict, log_close_prices: dict):
-        """
-        负责读取 run 策略的配置文件，用新计算出的参数，完整地覆盖旧的参数部分，然后写回。
-        """
-        if not new_params:
-            raise ValueError("参数结果为空，保留原参数文件")
-        run_config_path = (
-            Path(self.config.get("user_data_dir", "user_data"))
-            / self.config.get("pair_parameters_file", "config/future_run_paraV6.json")
-        )
-
-        logger.info(f"准备将 {len(new_params)} 个配对的新参数写入到: {run_config_path}")
-
-        try:
-            pvalue_dict = {}
-            gamma_dict = {}
-            c_dict = {}
-            z_mean_dict = {}
-            z_std_dict = {}
-            z_cross_zero_count_dict = {}
-            consistency_score_dict = {}
-            half_life_dict = {}
-            corr_dict = {}
-            adfstat_dict = {}
-
-            for key, params in new_params.items():
-                y = params["regression_y"]
-                x = params["regression_x"]
-
-                pvalue_dict[f"{y}_{x}_pvalue"] = params["pvalue"]
-                adfstat_dict[f"{y}_{x}_adfstat"] = params["adfstat"]
-                gamma_dict[f"{y}_{x}_gamma"] = params["gamma"]
-                c_dict[f"{y}_{x}_c"] = params["c"]
-                z_mean_dict[f"{y}_{x}_z_mean"] = params["z_mean"]
-                z_std_dict[f"{y}_{x}_z_std"] = params["z_std"]
-                z_cross_zero_count_dict[f"{y}_{x}_z_cross_zero_count"] = params[
-                    "z_cross_zero_count"
-                ]
-                consistency_score_dict[f"{y}_{x}_consistency_score"] = params["consistency_score"]
-                half_life_dict[f"{y}_{x}_half_life"] = params["half_life"]
-                corr_dict[f"{y}_{x}_corr"] = params["corr"]
-
-            run_config_data = {}
-            if os.path.exists(run_config_path):
-                with open(run_config_path, "r", encoding="utf-8") as f:
-                    run_config_data = json.load(f)
-            else:
-                logger.warning(f"目标配置文件 {run_config_path} 不存在，将创建一个新的。")
-
-            run_config_data["pvalue_dict"] = pvalue_dict
-            run_config_data["adfstat_dict"] = adfstat_dict
-            run_config_data["gamma_dict"] = gamma_dict
-            run_config_data["c_dict"] = c_dict
-            run_config_data["z_mean_dict"] = z_mean_dict
-            run_config_data["z_std_dict"] = z_std_dict
-            run_config_data["z_cross_zero_count_dict"] = z_cross_zero_count_dict
-            run_config_data["consistency_score_dict"] = consistency_score_dict
-            run_config_data["half_life_dict"] = half_life_dict
-            run_config_data["corr_dict"] = corr_dict
-            run_config_data["log_close_dict"] = log_close_prices
-
-            payload = json.dumps(
-                self.convert_numpy_types(run_config_data),
-                ensure_ascii=False,
-                indent=4,
-                allow_nan=False,
-            )
-            run_config_path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = None
-            try:
-                with tempfile.NamedTemporaryFile(
-                    mode="w", encoding="utf-8", dir=run_config_path.parent, delete=False
-                ) as f:
-                    temporary = f.name
-                    f.write(payload)
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.replace(temporary, run_config_path)
-            finally:
-                if temporary and os.path.exists(temporary):
-                    os.unlink(temporary)
-
-            logger.info(f"成功覆写 run 策略的配置文件！")
-
-        except Exception as e:
-            logger.exception("覆写配置文件失败，原文件保持不变")
-            raise

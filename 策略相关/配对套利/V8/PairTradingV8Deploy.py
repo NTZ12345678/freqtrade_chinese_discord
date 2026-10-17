@@ -9,20 +9,23 @@ announcements, frozen market precision, settlement candles and native replay ada
 Each leg retains its entry parameters. Old admitted relationships keep their original
 coefficients; new relationships sharing an occupied or banned coin are rejected.
 
-N14 / 1x / K18 deployment defaults come from configuration. V7 is archived;
+N14 / 1x / K18 deployment defaults can be overridden in configuration. V7 is archived;
 persisted trade/state schemas and the original N/leverage search remain compatible.
 V8 acceptance: research/maintenance/v8_capacity_20261011/.
 """
 
 
 import builtins
+import datetime as dt
+import hashlib
+import os
+import tempfile
 from copy import deepcopy
 from datetime import timedelta
 import json
 import logging
 import math
 from pathlib import Path
-import sys
 import time
 
 import numpy as np
@@ -31,11 +34,214 @@ from freqtrade.persistence import Trade
 from freqtrade.strategy import CategoricalParameter, IntParameter
 from freqtrade.strategy.interface import IStrategy
 
-# Deployment utilities own the release and lifecycle state formats.
 HERE = Path(__file__).resolve().parent
-DEPLOY = HERE.parent.parent / "deployment/binance_cross"
-sys.path.insert(0, str(DEPLOY if (DEPLOY / "runtime.py").is_file() else HERE))
-from runtime import atomic, canonical, pair_key, merge_combinations, load_release, configure_capacity, positive_count
+UTC = dt.timezone.utc
+PARAMS = ('gamma', 'c', 'z_mean', 'z_std', 'half_life', 'adfstat')
+
+
+def positive_count(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(name + ' must be a positive integer')
+    return value
+
+
+def configure_capacity(config, max_pairs=None):
+    """Pin K without adding a search dimension; leave room for both legs in the engine."""
+    fixed = dict(config.get('atr_fixed_parameters', {}))
+    k = positive_count(fixed.get('max_pairs', 18) if max_pairs is None else max_pairs, 'max_pairs')
+    fixed['max_pairs'] = k
+    config['atr_fixed_parameters'] = fixed
+    config['max_open_trades'] = max(2 * k, config.get('max_open_trades', 0))
+    return k
+
+
+def configure_deployment(config):
+    """Supply production defaults without creating releases or replacing explicit settings."""
+    fixed = dict(n_days=14, leverage_choice=1, max_pairs=18)
+    fixed.update(config.get('atr_fixed_parameters', {}))
+    config['atr_fixed_parameters'] = fixed
+    root = Path(config.get('user_data_dir', 'user_data')) / 'v8'
+    mode = getattr(config.get('runmode'), 'value', config.get('runmode'))
+    config.setdefault('atr_release_root', config.get('atr_parameters', str(root / 'parameters.json')))
+    config.setdefault('atr_state_path', str(root / 'state' / ('live.json' if mode == 'live' else 'dryrun.json')))
+    config.setdefault('atr_live_delisting', str(root / 'state/live_delisting.json'))
+    if not config.get('atr_schedule'):
+        try:
+            _, _, schedule = load_release(config['atr_release_root'])
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise ValueError('V8 needs a valid parameter release at '
+                             + str(config['atr_release_root'])
+                             + '; publish getpara results before starting') from exc
+        config['atr_schedule'] = str(schedule)
+
+
+def atomic(path, value):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix='.' + path.name, dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(value, f, ensure_ascii=False, indent=2, allow_nan=False)
+            f.write('\n')
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(name, path)
+    finally:
+        Path(name).unlink(missing_ok=True)
+
+
+def digest(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, allow_nan=False).encode()).hexdigest()
+
+
+def canonical(row):
+    return tuple(sorted((row['pair_A'], row['pair_B'])))
+
+
+def pair_key(row):
+    return row['pair_A'] + '_' + row['pair_B']
+
+
+def validate_snapshot(snapshot, now=None):
+    now = now or dt.datetime.now(UTC)
+    if set(snapshot) == {'asof', 'selected'}:
+        snapshot = dict(snapshot, complete=True, exchange='binance', margin_mode='cross',
+                        lookback_start=(dt.datetime.fromisoformat(snapshot['asof'])-dt.timedelta(days=90)).isoformat())
+    if not snapshot.get('complete') or snapshot.get('exchange') != 'binance' or snapshot.get('margin_mode') != 'cross':
+        raise ValueError('Incomplete or non-Binance/cross snapshot')
+    at = dt.datetime.fromisoformat(snapshot['asof'])
+    start = dt.datetime.fromisoformat(snapshot['lookback_start'])
+    if at.tzinfo is None or start.tzinfo is None or at > now or at-start != dt.timedelta(days=90):
+        raise ValueError('Expected causal, timezone-aware 90-day snapshot')
+    if not snapshot.get('selected'):
+        raise ValueError('No selected combinations; do not replace working release')
+    seen = set()
+    for row in snapshot['selected']:
+        legs = canonical(row)
+        if legs[0] == legs[1] or legs in seen or not all(p.endswith('/USDT:USDT') for p in legs):
+            raise ValueError('Invalid or duplicate pair combination')
+        seen.add(legs)
+        if not all(not isinstance(row.get(k), bool) and isinstance(row.get(k), (int, float)) and math.isfinite(row[k]) for k in PARAMS):
+            raise ValueError('Invalid scientific parameters')
+        if row['gamma'] <= 0 or row['z_std'] <= 0 or not (0 < row['half_life'] < 500) or row['adfstat'] >= -6:
+            raise ValueError('Pair fails the agreed getpara filters')
+    return snapshot
+
+
+def publish(root, snapshot):
+    root = Path(root)
+    validate_snapshot(snapshot)
+    if root.suffix == '.json':
+        payload = parameter_payload(snapshot)
+        history = root.with_name(root.stem + '_history')
+        stamp = dt.datetime.fromisoformat(payload['asof']).astimezone(UTC).strftime('%Y%m%dT%H%M%SZ')
+        atomic(history / (stamp + '_' + digest(payload)[:12] + '.json'), payload)
+        atomic(root, payload)
+        return dict(release_id=digest(payload))
+    release_id = digest(snapshot)
+    release = root / 'releases' / release_id
+    release.mkdir(parents=True, exist_ok=True)
+    atomic(release / 'snapshot.json', snapshot)
+    atomic(release / 'schedule.json', [snapshot])
+    pointer = dict(schema=1, release_id=release_id, published_utc=dt.datetime.now(UTC).isoformat())
+    # One pointer is the commit point; readers never see a half-published release.
+    atomic(root / 'current.json', pointer)
+    return pointer
+
+
+def load_release(root, now=None):
+    root = Path(root)
+    if root.suffix == '.json':
+        snapshot = json.loads(root.read_text())
+        validate_snapshot(snapshot, now)
+        return dict(release_id=digest(snapshot)), snapshot, root
+    pointer = json.loads((root / 'current.json').read_text())
+    ident = pointer['release_id']
+    if len(ident) != 64 or any(c not in '0123456789abcdef' for c in ident):
+        raise ValueError('Invalid release identifier')
+    path = root / 'releases' / ident
+    snapshot = json.loads((path / 'snapshot.json').read_text())
+    if digest(snapshot) != ident or json.loads((path / 'schedule.json').read_text()) != [snapshot]:
+        raise ValueError('Release checksum/schedule mismatch')
+    validate_snapshot(snapshot, now)
+    return pointer, snapshot, path / 'schedule.json'
+
+
+def merge_combinations(old, new, retired=(), blocked_coins=()):
+    """Admit only disjoint relationships; rejected new pairs are not queued."""
+    result, seen = [], set()
+    retired = {tuple(x) for x in retired}
+    for row in old:
+        key = canonical(row)
+        if key in seen or key in retired:
+            continue
+        seen.add(key)
+        result.append(row)
+    occupied = set(blocked_coins) | {p for row in result for p in canonical(row)}
+    for row in new:
+        key = canonical(row)
+        if key in seen or key in retired or occupied.intersection(key):
+            continue
+        result.append(row)
+        seen.add(key)
+        occupied.update(key)
+    return result
+
+
+def parameter_payload(snapshot):
+    """The public getpara file contains only the cutoff and fitted selections."""
+    validate_snapshot(snapshot)
+    selected = [{name: row[name] for name in ('pair_A', 'pair_B', *PARAMS)}
+                for row in snapshot['selected']]
+    occupied = set()
+    for row in selected:
+        if occupied.intersection(canonical(row)):
+            raise ValueError('A getpara publication must contain disjoint combinations')
+        occupied.update(canonical(row))
+    return dict(asof=snapshot['asof'], selected=selected)
+
+
+def parameter_path(config):
+    return Path(config.get('atr_parameters',
+                str(Path(config.get('user_data_dir', 'user_data')) / 'v8/parameters.json')))
+
+
+def read_schedule(path):
+    """Read one compact file, archived compact files, or a legacy research schedule."""
+    path = Path(path)
+    files = sorted(path.glob('*.json')) if path.is_dir() else [path]
+    result = {}
+    for file in files:
+        data = json.loads(file.read_text())
+        for snapshot in data if isinstance(data, list) else [data]:
+            validate_snapshot(snapshot)
+            at = dt.datetime.fromisoformat(snapshot['asof'])
+            if at in result and result[at] != snapshot:
+                raise ValueError('Conflicting publications have the same cutoff; select a file explicitly')
+            result[at] = snapshot
+    if not result:
+        raise ValueError('No parameter publications found at ' + str(path))
+    return [result[at] for at in sorted(result)]
+
+
+def default_config(pairs):
+    """Public Binance cross paper configuration, with no authentication material."""
+    return dict(
+        dry_run=True, dry_run_wallet=1000, trading_mode='futures', margin_mode='cross',
+        timeframe='5m', stake_currency='USDT', stake_amount='unlimited', max_open_trades=36,
+        tradable_balance_ratio=.99, fiat_display_currency='USD',
+        cancel_open_orders_on_exit=False,
+        unfilledtimeout=dict(entry=10, exit=10, exit_timeout_count=0, unit='minutes'),
+        entry_pricing=dict(price_side='other', use_order_book=True, order_book_top=1,
+                           check_depth_of_market=dict(enabled=False, bids_to_ask_delta=1)),
+        exit_pricing=dict(price_side='other', use_order_book=True, order_book_top=1),
+        exchange=dict(name='binance', key='', secret='', ccxt_config={}, ccxt_async_config={},
+                      pair_whitelist=sorted(pairs), pair_blacklist=[]),
+        pairlists=[dict(method='StaticPairList')],
+        api_server=dict(enabled=False, listen_ip_address='127.0.0.1', listen_port=8080,
+                        username='', password=''),
+        telegram=dict(enabled=False, token='', chat_id=''), internals=dict(process_throttle_secs=5))
+
 
 log = logging.getLogger(__name__)
 
@@ -84,7 +290,7 @@ class PairTradingV8Deploy(IStrategy):
 
     # --- holding timeout, leverage and manually configured combination capacity --
     n_days = CategoricalParameter([7, 10, 14, 21, 30], default=14, space="atr")
-    leverage_choice = CategoricalParameter([1, 2, 3], default=2, space="atr")
+    leverage_choice = CategoricalParameter([1, 2, 3], default=1, space="atr")
     # Manual K deliberately preserves the existing N/leverage search (optimize=False).
     # Fixed configuration may pin any positive integer; this domain is not searched.
     max_pairs = IntParameter(1, 40, default=18, space="atr", optimize=False, load=False)
@@ -113,8 +319,12 @@ class PairTradingV8Deploy(IStrategy):
         # this class keeps its own candidate table, so the config is passed through as is.
         super().__init__(config)
         self.config = config
+        # Pin deployment defaults on this instance; an offline instance must keep
+        # its declared search space even after another bot has been constructed.
+        for name in self.OVERRIDABLE_PARAMETERS:
+            setattr(self, name, deepcopy(getattr(self, name)))
         schedule_path = self._schedule_path(config)
-        self.schedule = json.loads(schedule_path.read_text())
+        self.schedule = read_schedule(schedule_path)
         self.schedule.sort(key=lambda s: s["asof"])
         for name, value in config.get("atr_fixed_parameters", {}).items():
             # atr_period / atr_multiple / hard_loss_pct / timeout_days pinned parameters
@@ -164,8 +374,9 @@ class PairTradingV8Deploy(IStrategy):
         mode = getattr(config.get('runmode'), 'value', config.get('runmode'))
         if mode not in ('dry_run', 'live'):
             raise ValueError('Deployment class requires dry_run/live; use research classes for backtests')
-        if not config.get('atr_schedule') or not config.get('atr_release_root') or not config.get('atr_state_path'):
-            raise ValueError('Start deployment through launch.py; explicit release/state paths required')
+        if (config.get('exchange', {}).get('name'), config.get('trading_mode'), config.get('margin_mode')) != ('binance', 'futures', 'cross'):
+            raise ValueError('V8 requires Binance USDT perpetual futures in cross mode')
+        configure_deployment(config)
 
     def _initialize_inputs(self, config):
         # Deployment never installs historical exchange/custom-data hooks.

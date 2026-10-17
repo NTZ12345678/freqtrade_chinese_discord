@@ -19,8 +19,7 @@ from freqtrade.persistence import Trade, LocalTrade
 from freqtrade.exchange.exchange_utils import amount_to_contract_precision
 from freqtrade.strategy.interface import StrategyResultValidator
 
-from PairTradingV8Deploy import PairTradingV8Deploy
-from runtime import canonical, pair_key, merge_combinations
+from PairTradingV8Deploy import PairTradingV8Deploy, canonical, pair_key, merge_combinations, parameter_path
 
 STUDY = Path(__file__).resolve().parent.parent.parent / 'research/binance_cross_v1'
 if not STUDY.is_dir():
@@ -144,7 +143,9 @@ class PairTradingV8Aligned(PairTradingV8Deploy):
         super().__init__(config)
         self._publication_times = []
         previous = None
-        delay = pd.Timedelta(minutes=float(config.get('atr_publication_delay_minutes', 0)))
+        compact = any(set(snapshot) == {'asof', 'selected'} for snapshot in self.schedule)
+        self._compact_parameters = compact
+        delay = pd.Timedelta(minutes=float(config.get('atr_publication_delay_minutes', 15 if compact else 0)))
         if delay < pd.Timedelta(0):
             raise ValueError('Publication delay cannot be negative')
         for snapshot in self.schedule:
@@ -182,6 +183,8 @@ class PairTradingV8Aligned(PairTradingV8Deploy):
         mode = getattr(config.get('runmode'), 'value', config.get('runmode'))
         if mode not in ('backtest', 'hyperopt'):
             raise ValueError('Aligned adapter is offline only; use PairTradingV8Deploy on the server')
+        if (config.get('exchange', {}).get('name'), config.get('trading_mode'), config.get('margin_mode')) != ('binance', 'futures', 'cross'):
+            raise ValueError('V8 requires Binance USDT perpetual futures in cross mode')
         if config.get('timeframe','5m') != '5m':
             raise ValueError('Aligned replay is specified for 5m candles')
         if config.get('timeframe_detail'):
@@ -191,7 +194,10 @@ class PairTradingV8Aligned(PairTradingV8Deploy):
         self._offline = True
         self._state_path = _MemoryState()
         _install_custom_data_index()
-        snapshot = STUDY / 'exchange_snapshot.json'
+        snapshot = Path(config.get('atr_exchange_snapshot', str(STUDY / 'exchange_snapshot.json')))
+        self._market_snapshot = snapshot
+        if config.get('atr_exchange_snapshot') and not snapshot.exists():
+            raise ValueError('Configured frozen exchange snapshot does not exist')
         if snapshot.exists():
             _install_frozen_markets(snapshot)
             self._precision_mode = json.loads(snapshot.read_text())['precision_mode']
@@ -218,7 +224,7 @@ class PairTradingV8Aligned(PairTradingV8Deploy):
         self._injected_frames = {}
 
     def _schedule_path(self, config):
-        return Path(config.get('atr_schedule', str(STUDY / 'snapshots/schedule.json')))
+        return Path(config['atr_schedule']) if config.get('atr_schedule') else parameter_path(config)
 
     def _reset(self):
         super()._reset()
@@ -233,8 +239,9 @@ class PairTradingV8Aligned(PairTradingV8Deploy):
     def _install_adapters(self):
         _install_signal_bridge()
         self._engine_signal_hash=ENGINE_SHA256
-        if (STUDY/'exchange_snapshot.json').exists():
-            _install_frozen_markets(STUDY/'exchange_snapshot.json')
+        snapshot = getattr(self, '_market_snapshot', STUDY/'exchange_snapshot.json')
+        if snapshot.exists():
+            _install_frozen_markets(snapshot)
 
     def __setstate__(self,state):
         # Joblib may unpickle a strategy into a fresh worker before generator dispatch.
@@ -243,6 +250,8 @@ class PairTradingV8Aligned(PairTradingV8Deploy):
         self._install_adapters()
 
     def bot_start(self, **kwargs):
+        if self._compact_parameters and (not self.config.get('atr_historical_delistings') or not self.settlements_path.exists()):
+            raise ValueError('Aligned replay requires frozen historical delisting announcements and a settlement table; do not use the live monitor file')
         self._install_adapters()
         self._engine_delisting = self._probe_engine_settlement()
         self._metrics.update(settlement_engine_checked=len(self._engine_delisting),
@@ -442,8 +451,11 @@ class PairTradingV8Aligned(PairTradingV8Deploy):
             return self._exchange.amount_to_contract_precision(pair,amount)
         market=self._exchange.markets[pair]
         # Hyperopt workers deliberately have no live ccxt API client.
+        mode = getattr(self, '_precision_mode', None)
+        if mode is None:
+            mode = self._exchange.precisionMode
         return amount_to_contract_precision(amount,market["precision"]["amount"],
-            self._precision_mode,market.get("contractSize") or 1)
+            mode,market.get("contractSize") or 1)
 
     def populate_indicators(self,dataframe,metadata):
         names=('open','high','low','close','volume')
