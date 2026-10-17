@@ -1,0 +1,23 @@
+1、运行环境：Freqtrade 2026.9，另安装 statsmodels。使用 Binance U本位永续合约、5m K线、全仓模式。
+
+2、本版已合并Shadow与基础版，固定包含K外模拟仓，不再分别选择版本。
+PairTradingV8Deploy：模拟盘/实盘入口。
+PairTradingV8Aligned：离线回测入口，继承相同交易逻辑。
+pair_trading_get_para_V8：计算币对。
+runtime.py ：参数、状态文件和组合关系的管理。
+将这四个文件一起放入 user_data/strategies/。三个回测工具已内置到 PairTradingV8Aligned.py，部署端不会安装这些回测适配。
+
+3、先手动计算此前90天的Binance参数，通过配套V8筛选/发布工具生成参数目录，每批最多40组。后续更新也手动进行。
+pair_trading_get_para_V8.py 内部类名仍为 pair_trading_get_para_V6，只提供计算组件；完整下载、筛选和发布工具不在本目录，不能直接把旧版字典JSON当作V8发布包。
+
+4、在Freqtrade配置中设置 dry_run=true，exchange.name="binance"、trading_mode="futures"、margin_mode="cross"。atr_fixed_parameters 设置 n_days=14、leverage_choice=1、max_pairs=18；max_open_trades 至少为 2×max_pairs。
+同时填写 atr_release_root（参数目录）、atr_schedule（该发布包的schedule.json）、atr_state_path（生命周期状态JSON）、atr_live_delisting（退市监控JSON）。首次 pair_whitelist 要覆盖参数发布包内的币种，并使用 StaticPairList。
+
+5、先运行配套退市监控，确认监控文件更新正常，再启动模拟盘：
+freqtrade trade --config user_data/config_v8.json --strategy-path user_data/strategies --strategy PairTradingV8Deploy
+确认双腿入场、退出和N计时正常后，再另行准备实盘。API密钥通过环境变量提供，不写入源码或上传GitHub。
+
+6、K控制真实持仓容量，40控制每批候选数，两者独立。K外模拟仓不占资金和名额，转实仓时继承模拟N起点；已有仓位不随入金或K变化而调整大小。
+重启须保留原交易数据库、参数发布目录和生命周期状态，不能清空模拟记录来重置N。
+
+7、离线回测还需配套研究入口、因果参数日程、行情/资金费、冻结市场规则及退市结算适配。本目录不包含完整研究控制器和数据；历史回测结果仍对应报告注明的冻结版本。
